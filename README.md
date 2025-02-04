@@ -7,6 +7,9 @@ The code has been made as part of a course of Assembly, the code might neither b
 Discord :
 - ``.naii.`` (don't forget the dots)\
 - ``adam10_``
+- ``ryaaan0142``
+- ``kizaru6540``
+
 
 ## Code
 This repository contains a server-side code and a client-side code for a c2 in NASM x64. \
