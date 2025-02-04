@@ -4,7 +4,7 @@ The code has been made as part of a course of Assembly, the code might neither b
 
 ## Contact 
 
-Discord : \
+Discord :
 - ``.naii.`` (don't forget the dots)\
 - ``adam10_``
 
@@ -58,5 +58,5 @@ Next things that will be added if time is found:
  - 🗒️ Client screenshots mechanism
 
 ## Contribution
-This code isn't really meant to exist outside of the course it very probably wont be maintained after it, but if you want to reuse it or upgrade it, feel free to do so.
-If you want to make an upgrade on the code present on this repo, feel free to PM on discord.
+This code isn't really meant to exist outside of the course it very probably wont be maintained after it, but if you want to reuse it or upgrade it, feel free to do so. \
+If you want to make an upgrade/modification on the code present on this repo, feel free to PM on discord to discuss.
