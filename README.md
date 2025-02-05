@@ -1,11 +1,11 @@
 # nasm_c2
-Mini c2 in ASM x64. \
-The code has been made as part of a course of Assembly, the code might neither be optimised nor perfect and very probably not secure enough.
+Small c2 in ASM x64. \
+The code has been made as part of an Assembly course project, the code might neither be optimised nor perfect and very probably not secure enough.
 
 ## Contact 
 
 Discord :
-- ``.naii.`` (don't forget the dots)\
+- ``.naii.``
 - ``adam10_``
 - ``ryaaan0142``
 - ``kizaru6540``
@@ -45,11 +45,11 @@ Commands can be used 2 ways:
  - Send the command to every client
  - Send the command to one specific client
 
-To send a command to every client, just type the command and it'll send it to every client. \
+To send a command to every client, just type the command and it'll send it to every client.
 For example : \
 ``PING`` will send a PING request to every client, and will receive the answer from each server.
 
-To send a command to a specific client, you need to add ``<fd>:`` before your command \ 
+To send a command to a specific client, you need to add ``<fd>:`` before your command
 For example : \
 ``4:bash ls`` will execute "ls" in the client with the file descriptor n°4 running directory
 
