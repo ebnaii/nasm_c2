@@ -9,6 +9,7 @@
 ; possible commands are : PING (answer PONG from client) and bash [BASH COMMAND]
 ; Still as an exemple : 6:bash ls
 ; will display in server cli the result of ls on client with file descriptor 6.
+; Now also handles COPY command from the client, will output the text to "recv_" file.
 ;------------------------------
 global _start
 
@@ -19,17 +20,18 @@ section .data
     server_addr:
        dw 2             ; sin_family = AF_INET
        dw 0x5c11        ; sin_port = 4444 (port in network order: 0x115c → 0x5c11 in little-endian)
-       ;dd 0x0100007f    ; sin_addr = 127.0.0.1 (0x7F000001)
-       dd 0x1701a8c0    ; 192.168.1.23
+       dd 0x0100007f    ; sin_addr = 127.0.0.1 (0x7F000001)
        times 8 db 0     ; sin_zero[8]
     server_addr_len equ 16
 
     newline_str         db 10, 0
     client_msg_prefix   db "From client ", 0
     client_msg_suffix   db ": ", 10
-    server_msg_prefix   db "From server: ", 0
+    server_msg_prefix   db "", 0
     connected_clients_msg db "Connected clients: ", 0
     space               db " ", 0
+
+    recv_prefix_str     db "recv_", 0
 
 section .bss
     ; Each pollfd entry is 8 bytes:
@@ -38,6 +40,8 @@ section .bss
     ;   [6..7]  revents (short, 16 bits)
     pollfds resb MAX_POLLFD*8
     buf     resb 1024       ; message buffer
+
+    copy_out_buf resb 256   ; buffer for the output filename
 
 section .text
 
@@ -114,6 +118,9 @@ server_loop:
 .next_poll_fd:
     inc r14
     jmp .poll_loop
+
+.after_poll_loop:
+    jmp server_loop
 
 ; -----------------------------------------------
 .handle_server_socket:
@@ -253,6 +260,7 @@ server_loop:
     shl rcx, 3               ; rcx = r14 * 8 (pollfd entry size)
     lea rbx, [pollfds + rcx]
     mov edi, dword [rbx]     ; retrieve the client's FD
+    mov r15, rdi             ; store client FD for COPY usage
 
     ; Block read (up to 1024 bytes) from the client
     mov rdi, rdi             ; client FD
@@ -264,6 +272,32 @@ server_loop:
     jle .client_disconnect
     mov r8, rax              ; r8 = number of bytes read
 
+    ; Check if this is the start of a COPY header
+    ; "COPY HEADER: <filename>\n"
+    ; Minimal length is about 13+ bytes ("COPY HEADER: ")
+    cmp r8, 13
+    jb .normal_message
+    mov eax, dword [buf]
+    cmp eax, 0x59504F43     ; "COPY"
+    jne .normal_message
+    cmp byte [buf+4], 0x20
+    jne .normal_message
+    ; Then check "HEADER:"
+    mov eax, dword [buf+5]
+    cmp eax, 0x44414548     ; "HEAD"
+    jne .normal_message
+    cmp byte [buf+9], 0x45  ; 'E'
+    jne .normal_message
+    cmp byte [buf+10],0x52  ; 'R'
+    jne .normal_message
+    cmp byte [buf+11],0x3A  ; ':'
+    jne .normal_message
+
+    ; If recognized as COPY HEADER, handle file reception
+    call handle_copy_receive
+    jmp .clear_revents_and_next
+
+.normal_message:
     ; Print header once: "From client <fd>: "
     lea rdi, [rel client_msg_prefix]
     call print_string
@@ -272,7 +306,7 @@ server_loop:
     lea rdi, [rel client_msg_suffix]
     call print_string
 
-    ; Print the full message received (possibly multiple lines)
+    ; Print the full message received
     mov rdi, 1               ; STDOUT
     lea rsi, [buf]
     mov rdx, r8              ; number of bytes read
@@ -283,38 +317,6 @@ server_loop:
     lea rdi, [rel newline_str]
     call print_string
 
-    jmp .clear_revents_and_next
-
-.read_loop:
-    mov rdi, rdi         ; client FD
-    lea rsi, [buf + r8]
-    mov rdx, 1           ; read 1 byte
-    mov rax, 0           ; sys_read
-    syscall
-    cmp rax, 0
-    jle .client_disconnect
-    ; Check if the character read is a newline (LF, 10)
-    cmp byte [buf + r8], 10
-    je .done_read
-    inc r8
-    cmp r8, 1023
-    jl .read_loop
-.done_read:
-    inc r8  ; include the newline in the total length
-    ; Print: "From client <fd>: <message>"
-    lea rdi, [rel client_msg_prefix]
-    call print_string
-    mov edi, dword [rbx]
-    call print_decimal
-    lea rdi, [rel client_msg_suffix]
-    call print_string
-    mov rdi, 1           ; STDOUT
-    lea rsi, [buf]
-    mov rdx, r8          ; r8 contains the total number of bytes read
-    mov rax, 1           ; sys_write
-    syscall
-    lea rdi, [rel newline_str]
-    call print_string
     jmp .clear_revents_and_next
 
 .client_disconnect:
@@ -344,9 +346,6 @@ server_loop:
     mov word [rbx + 6], 0
     inc r14
     jmp .poll_loop
-
-.after_poll_loop:
-    jmp server_loop
 
 server_exit:
     mov rdi, 0
@@ -414,3 +413,199 @@ print_decimal:
     add rsp, 32
     pop rbp
     ret
+
+; ------------------------------------------------
+; Subroutine: copy_string
+; Copies the null-terminated string from RSI to RDI.
+; On return, RDI points to the end of the copied string.
+copy_string:
+    push rsi
+.copy_loop:
+    lodsb
+    stosb
+    cmp al, 0
+    jne .copy_loop
+    pop rsi
+    ret
+
+; ------------------------------------------------
+; COPY COMMAND SECTION
+; The client sends:
+;   "COPY HEADER: <filename>\n"
+;   [file data... possibly in multiple chunks]
+;   "COPY FOOTER: <filename>\n"
+; This function receives the header, opens "recv_", then reads chunks
+; until the substring "COPY FOOTER:" is found. Only bytes before that footer are written.
+handle_copy_receive:
+    ; The header is "COPY HEADER: " => 12 bytes + at least 1 char for the filename
+    ; We'll parse the filename starting at buf+12
+    lea rsi, [buf+12]
+
+    ; Remove any newline in the header line
+    xor rcx, rcx
+.copy_recv_remove_newline:
+    mov al, [rsi+rcx]
+    cmp al, 10
+    je .copy_recv_found_newline
+    test al, al
+    jz .copy_recv_done_remove
+    inc rcx
+    jmp .copy_recv_remove_newline
+
+.copy_recv_found_newline:
+    mov byte [rsi+rcx], 0
+
+.copy_recv_done_remove:
+    ; Build "recv_<filename>"
+    lea rdi, [copy_out_buf]
+    mov rsi, recv_prefix_str
+    call copy_string
+    lea rsi, [buf+12]
+    call copy_string
+
+    ; Open output file in write mode (O_CREAT|O_WRONLY=65, mode=0644)
+    mov rdi, -100
+    lea rsi, [copy_out_buf]
+    mov rdx, 65
+    mov r10, 420
+    mov rax, 257
+    syscall
+    cmp rax, 0
+    jl .copy_recv_error
+    mov rbx, rax
+
+    ; Now read data until we detect "COPY FOOTER:"
+.copy_recv_loop:
+    mov rdi, r15   ; client FD
+    lea rsi, [buf]
+    mov rdx, 1024
+    mov rax, 0     ; sys_read
+    syscall
+    cmp rax, 0
+    jle .copy_recv_finish
+
+    ; Search for "COPY FOOTER:" inside this chunk
+    ; If found, we only write the data before the footer
+    ; Then stop receiving.
+    push rax            ; save number of bytes read
+    mov rdi, buf
+    mov rsi, rax
+    mov rdx, buf        ; we can reuse the buffer base
+    call find_footer_substring
+    ; On return, RCX = offset of footer or -1 if not found
+    pop rax             ; restore number of bytes read in RAX
+
+    cmp rcx, -1
+    je .no_footer_found
+    ; footer found at offset RCX, write only up to RCX
+    mov rdx, rcx
+    jle .write_nothing_if_neg  ; just in case
+
+    mov rdi, rbx       ; file FD
+    mov rsi, buf
+    mov rax, 1         ; sys_write
+    syscall
+    jmp .copy_recv_finish
+
+.write_nothing_if_neg:
+    ; if rcx < 0, do nothing
+    jmp .copy_recv_finish
+
+.no_footer_found:
+    ; write entire chunk
+    mov rdi, rbx
+    mov rsi, buf
+    mov rdx, rax
+    mov rax, 1
+    syscall
+    jmp .copy_recv_loop
+
+.copy_recv_finish:
+    ; close the file
+    mov rdi, rbx
+    mov rax, 3
+    syscall
+    ret
+
+.copy_recv_error:
+    ret
+
+;------------------------------------------------
+; find_footer_substring
+; Input:
+;   RDI = pointer to buffer
+;   RSI = length of data read
+;   RDX = base address of buffer (we can reuse RDX or not)
+; Output:
+;   RCX = offset of "COPY FOOTER:" if found, else -1
+; This is a simple substring search for "COPY FOOTER:" in the chunk.
+; If found, we return the offset of the substring start in RCX.
+; If not found, RCX = -1.
+find_footer_substring:
+    push rbp
+    mov rbp, rsp
+
+    ; "COPY FOOTER:" is 12 bytes
+    ; We'll do a naive search
+    ; RDI = buffer start
+    ; RSI = data length
+    ; RDX = buffer base (not necessarily used, but we keep it as is)
+    mov r8, rdi         ; keep pointer to buffer
+    mov r9, rsi         ; keep length
+    mov rcx, -1         ; default = not found
+
+    cmp r9, 12
+    jb .footer_not_found
+
+    ; We'll loop from 0 to r9-12
+    xor r10, r10        ; index
+.search_loop:
+    cmp r10, r9
+    jge .footer_not_found
+    ; check if we have at least 12 bytes from r10
+    mov rax, r9
+    sub rax, r10
+    cmp rax, 12
+    jb .footer_not_found
+
+    ; compare 12 bytes to "COPY FOOTER:"
+    ; "COPY FOOTER:" in little-endian is:
+    ;  0x59504F43, 0x20524520, ...
+    ; but simpler to compare char by char
+    ; We'll do a small local loop
+    push r10
+
+    mov r11, 0
+.compare_12:
+    cmp r11, 12
+    je .found_footer
+    lea rax, [r10 + r11]
+    mov al, [r8 + rax]
+    cmp al, [footer_str + r11]
+    jne .not_equal
+    inc r11
+    jmp .compare_12
+
+.found_footer:
+    ; r10 = index of substring
+    mov rcx, r10        ; store offset in rcx
+    pop r10
+    jmp .end_search
+
+.not_equal:
+    pop r10
+    inc r10
+    jmp .search_loop
+
+.footer_not_found:
+    jmp .end_search
+
+.end_search:
+    mov rax, rcx
+    mov rsp, rbp
+    pop rbp
+    ret
+
+; The "COPY FOOTER:" literal for direct comparison:
+section .rodata
+footer_str db "COPY FOOTER:", 0
